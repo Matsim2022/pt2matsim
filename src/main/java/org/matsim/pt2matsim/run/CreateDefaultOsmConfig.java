@@ -33,7 +33,10 @@ public final class CreateDefaultOsmConfig {
 	 */
 	public static void main(final String[] args) {
 		if(args.length < 1) {
-			throw new IllegalArgumentException("Config file name as argument needed");
+/**			throw new IllegalArgumentException("Config file name as argument needed");
+ *
+ */
+            throw new IllegalArgumentException("Config file name as argument needed");
 		}
 
 		OsmConverterConfigGroup defaultConfig = OsmConverterConfigGroup.createDefaultConfig();
