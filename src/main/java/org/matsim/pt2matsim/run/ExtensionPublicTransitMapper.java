@@ -18,12 +18,14 @@ import org.matsim.pt2matsim.tools.ScheduleTools;
 import java.io.File;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * ExtensionPublicTransitMapper (parallel & batched)
  * - Maps TransitRoutes per shape_id
  * - Runs mapping in parallel using 16 threads
  * - Writes one temporary schedule file for every 10 shapes
+ * - Logs live batch and global progress
  */
 public final class ExtensionPublicTransitMapper {
 
@@ -55,48 +57,61 @@ public final class ExtensionPublicTransitMapper {
         if (!tempDirFile.exists()) tempDirFile.mkdirs();
         log.info("Temporary schedules will be saved in: " + tempDir);
 
-        // Scenario + factory
-        Scenario scenario = ScenarioUtils.createScenario(ConfigUtils.createConfig());
-        TransitScheduleFactory scheduleFactory = scenario.getTransitSchedule().getFactory();
-
         // Group routes by shape_id
         Map<String, List<Map.Entry<TransitLine, TransitRoute>>> shapeToRoutes = new HashMap<>();
         for (TransitLine line : schedule.getTransitLines().values()) {
             for (TransitRoute route : line.getRoutes().values()) {
                 String shapeId = route.getAttributes().getAttribute("shape_id") != null
                         ? route.getAttributes().getAttribute("shape_id").toString()
-                        : route.getId().toString();
+                        : line.getId() + "_" + route.getId();
+
                 shapeToRoutes.computeIfAbsent(shapeId, k -> new ArrayList<>())
                         .add(new AbstractMap.SimpleEntry<>(line, route));
             }
         }
 
-        log.info("Total unique shape_ids to map: " + shapeToRoutes.size());
+        int totalShapes = shapeToRoutes.size();
+        log.info("Total unique shape_ids to map: " + totalShapes);
 
-        // Prepare thread pool
+        // Prepare thread pool and progress counter
         int numThreads = Math.min(16, Runtime.getRuntime().availableProcessors());
         ExecutorService executor = Executors.newFixedThreadPool(numThreads);
         List<Future<?>> futures = new ArrayList<>();
+        AtomicInteger globalCounter = new AtomicInteger(0);
 
         List<String> shapeIds = new ArrayList<>(shapeToRoutes.keySet());
         int batchSize = 10;
+        int totalBatches = (int) Math.ceil((double) totalShapes / batchSize);
 
         for (int batchStart = 0; batchStart < shapeIds.size(); batchStart += batchSize) {
             int batchEnd = Math.min(batchStart + batchSize, shapeIds.size());
-            List<String> batchShapeIds = shapeIds.subList(batchStart, batchEnd);
+            List<String> batchShapeIds = new ArrayList<>(shapeIds.subList(batchStart, batchEnd));
             int batchIndex = batchStart / batchSize + 1;
 
             Future<?> future = executor.submit(() -> {
                 try {
+                    TransitScheduleFactory scheduleFactory = ScenarioUtils.createScenario(ConfigUtils.createConfig())
+                            .getTransitSchedule().getFactory();
                     TransitSchedule tempSchedule = scheduleFactory.createTransitSchedule();
 
+                    int batchProgress = 0;
                     for (String shapeId : batchShapeIds) {
+                        batchProgress++;
+                        int overall = globalCounter.incrementAndGet();
+                        double percent = (overall * 100.0 / totalShapes);
+
+                        log.info(String.format(
+                                "[Batch %d/%d] Processing shape_id=%s (%d/%d in batch, global: %d/%d, %.2f%%)",
+                                batchIndex, totalBatches, shapeId,
+                                batchProgress, batchShapeIds.size(),
+                                overall, totalShapes, percent));
+
                         List<Map.Entry<TransitLine, TransitRoute>> routes = shapeToRoutes.get(shapeId);
                         Map.Entry<TransitLine, TransitRoute> firstPair = routes.get(0);
                         TransitLine line = firstPair.getKey();
                         TransitRoute route = firstPair.getValue();
 
-                        // ✅ FIX: reuse existing line if already present
+                        // Reuse existing line if already present
                         TransitLine tempLine = tempSchedule.getTransitLines().get(line.getId());
                         if (tempLine == null) {
                             tempLine = scheduleFactory.createTransitLine(line.getId());
@@ -104,7 +119,7 @@ public final class ExtensionPublicTransitMapper {
                         }
                         tempLine.addRoute(route);
 
-                        // Copy stop facilities
+                        // Copy stop facilities safely
                         route.getStops().forEach(stop -> {
                             var facilityId = stop.getStopFacility().getId();
                             if (!tempSchedule.getFacilities().containsKey(facilityId)) {
@@ -116,11 +131,17 @@ public final class ExtensionPublicTransitMapper {
                     // Map this batch’s schedule
                     PTMapper.mapScheduleToNetwork(tempSchedule, network, config);
 
-                    // Write out the batch
+                    // Write out batch
                     String safeFileName = "batch_" + batchIndex + "_shapes_" + batchShapeIds.size() + ".xml";
                     String outputFile = tempDir + File.separator + safeFileName;
                     ScheduleTools.writeTransitSchedule(tempSchedule, outputFile);
-                    log.info("✅ Wrote batch " + batchIndex + " (" + batchShapeIds.size() + " shapes) -> " + outputFile);
+
+                    log.info(String.format(
+                            "✅ [Batch %d/%d] Completed (%d shapes). Cumulative progress: %d/%d (%.2f%%) -> %s",
+                            batchIndex, totalBatches, batchShapeIds.size(),
+                            globalCounter.get(), totalShapes,
+                            (globalCounter.get() * 100.0 / totalShapes),
+                            outputFile));
 
                 } catch (Exception e) {
                     log.error("❌ Error processing batch " + batchIndex, e);
@@ -136,7 +157,7 @@ public final class ExtensionPublicTransitMapper {
         }
 
         executor.shutdown();
-        log.info("✅ Completed mapping all batches (" + shapeIds.size() + " shapes total).");
+        log.info("✅ Completed mapping all batches (" + totalShapes + " shapes total).");
 
         // Step 3: Write output schedule & network
         if (config.getOutputNetworkFile() != null && config.getOutputScheduleFile() != null) {
@@ -158,3 +179,4 @@ public final class ExtensionPublicTransitMapper {
         }
     }
 }
+
